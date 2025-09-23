@@ -111,7 +111,6 @@ class CustomMatmulManager():
         blocks_x = (N + self.threads_per_dim - 1) // self.threads_per_dim
         blocks_y = (M + self.threads_per_dim - 1) // self.threads_per_dim
         
-        print(blocks_x, blocks_y)
         # check all of skip list in range of blocks
         for bx, by in skip_list:
             assert 0 <= bx < blocks_x and 0 <= by < blocks_y, f"Skip block ({bx}, {by}) out of range ({blocks_x}, {blocks_y})"

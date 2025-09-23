@@ -48,6 +48,7 @@ from .configuration_llama import LlamaConfig
 from .custom_matmul import CustomMatmulManager
 logger = logging.get_logger(__name__)
 matmul_manager = CustomMatmulManager(threads_per_dim=16)
+first_time = True
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -372,11 +373,14 @@ class LlamaModel(LlamaPreTrainedModel):
         use_custom_matmul: Optional[Dict[int, List[Tuple[int, int]]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        global first_time
         if use_custom_matmul is not None:
-            print("[WARN] [WARN] [WARN] Using experimental feature `use_custom_matmul`.")
-            for idx in use_custom_matmul:
+            if first_time:
+                print("[WARN] [WARN] [WARN] Using experimental feature `use_custom_matmul`.")
+                first_time = False
+            for idx in use_custom_matmul.keys():
                 assert isinstance(idx, int) and idx < len(self.layers) and idx < self.config.num_hidden_layers
-        
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
