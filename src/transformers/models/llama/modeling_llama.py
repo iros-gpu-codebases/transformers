@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List, Dict, Tuple
 
 import torch
 from torch import nn
@@ -45,9 +45,9 @@ from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import check_model_inputs
 from .configuration_llama import LlamaConfig
 
-
+from .custom_matmul import CustomMatmulManager
 logger = logging.get_logger(__name__)
-
+matmul_manager = CustomMatmulManager(threads_per_dim=16)
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -151,8 +151,17 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, use_custom_matmul:List[Tuple[int, int]] = None):
+        z = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        if use_custom_matmul is not None:
+            z2d = z.reshape(-1, z.size(-1))
+            down_proj2d = matmul_manager.multiply(
+                z2d, self.down_proj.weight.t(),
+                skip_list=use_custom_matmul
+            )
+            down_proj = down_proj2d.reshape(z.size(0), z.size(1), -1)
+        else:
+            down_proj = self.down_proj(z)
         return down_proj
 
 
@@ -286,6 +295,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        use_custom_matmul: List[Tuple[int, int]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -306,7 +316,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, use_custom_matmul=use_custom_matmul)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -359,8 +369,14 @@ class LlamaModel(LlamaPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        use_custom_matmul: Optional[Dict[int, List[Tuple[int, int]]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        if use_custom_matmul is not None:
+            print("[WARN] [WARN] [WARN] Using experimental feature `use_custom_matmul`.")
+            for idx in use_custom_matmul:
+                assert isinstance(idx, int) and idx < len(self.layers) and idx < self.config.num_hidden_layers
+        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -391,7 +407,10 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            this_layer_use_custom = None
+            if use_custom_matmul is not None and i in use_custom_matmul.keys():
+                this_layer_use_custom = use_custom_matmul[i]
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -399,6 +418,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                use_custom_matmul=this_layer_use_custom,
                 **kwargs,
             )
 
@@ -437,6 +457,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        use_custom_matmul: Optional[Dict[int, List[Tuple[int, int]]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -464,6 +485,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            use_custom_matmul=use_custom_matmul,
             **kwargs,
         )
 
