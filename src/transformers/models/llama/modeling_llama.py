@@ -481,6 +481,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        if use_custom_matmul is not None:
+            # check if all of the layer idx in range
+            for idx in use_custom_matmul.keys():
+                assert isinstance(idx, int) and idx < len(self.model.layers) and idx < self.model.config.num_hidden_layers
+        
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
