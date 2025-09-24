@@ -69,13 +69,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 """
 
 class CustomMatmulManager():
-    def __init__(self, threads_per_dim:int=16):
+    def __init__(self, threads_per_dim:int=16, save_kernels=False):
         self.threads_per_dim = threads_per_dim
         self.module_cache = {}
         # setup pymongo connection
         self.client = pymongo.MongoClient("mongodb://localhost:27017/")
         self.db = self.client["idak"]
         self.githash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+        self.save_kernels = save_kernels
 
     def get_module(self, skip_list: List[Tuple[int, int]] = []):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
@@ -94,15 +95,16 @@ class CustomMatmulManager():
                     verbose=True,
                 )
             }
-            self.db["custom_matmul_kernels"].insert_one({
-                "threads_per_dim": self.threads_per_dim,
-                "skip_list": skip_list,
-                "src": processed_src,
-                "githash": self.githash
-            })
+            if self.save_kernels:
+                self.db["custom_matmul_kernels"].insert_one({
+                    "threads_per_dim": self.threads_per_dim,
+                    "skip_list": skip_list,
+                    "src": processed_src,
+                    "githash": self.githash
+                })
         return self.module_cache[key]["kernel"]
 
-    def multiply(self, A, B, skip_list: List[Tuple[int, int]] = []):
+    def multiply(self, A, B, skip_list: List[Tuple[int, int]] = [], verbose=False):
         assert A.dim() == 2 and B.dim() == 2, "Only 2D tensors supported"
         assert A.shape[1] == B.shape[0], "Incompatible shapes for matmul"
         M = A.shape[0]
@@ -110,6 +112,9 @@ class CustomMatmulManager():
         # K = B.shape[1] # unused
         blocks_x = (N + self.threads_per_dim - 1) // self.threads_per_dim
         blocks_y = (M + self.threads_per_dim - 1) // self.threads_per_dim
+
+        if verbose:
+            print(f"[CustomMatmmulManager] bx={blocks_x}, by={blocks_y}")
         
         # check all of skip list in range of blocks
         for bx, by in skip_list:

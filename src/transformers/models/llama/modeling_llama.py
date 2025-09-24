@@ -158,7 +158,7 @@ class LlamaMLP(nn.Module):
             z2d = z.reshape(-1, z.size(-1))
             down_proj2d = matmul_manager.multiply(
                 z2d, self.down_proj.weight.t(),
-                skip_list=use_custom_matmul
+                skip_list=use_custom_matmul, verbose=True
             )
             down_proj = down_proj2d.reshape(z.size(0), z.size(1), -1)
         else:
