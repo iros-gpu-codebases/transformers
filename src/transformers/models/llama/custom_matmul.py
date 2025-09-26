@@ -3,6 +3,7 @@ from torch.utils.cpp_extension import load_inline
 
 import pymongo
 import subprocess
+import time 
 
 CUSTOM_KERNEL_TEMPLATE="""
 #include <torch/extension.h>
@@ -77,6 +78,7 @@ class CustomMatmulManager():
         self.db = self.client["idak"]
         self.githash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
         self.save_kernels = save_kernels
+        self.name = f"custom_matmul_{int(time.time()//1)}"
 
     def get_module(self, skip_list: List[Tuple[int, int]] = []):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
@@ -89,7 +91,7 @@ class CustomMatmulManager():
             self.module_cache[key] = {
                 "src": processed_src,   
                 "kernel": load_inline(
-                    name="custom_matmul",
+                    name=self.name,
                     cpp_sources="",
                     cuda_sources=processed_src,
                     verbose=True,
