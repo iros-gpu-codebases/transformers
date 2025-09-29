@@ -80,7 +80,7 @@ class CustomMatmulManager():
         self.save_kernels = save_kernels
         self.name = f"custom_matmul_{int(time.time()//1)}"
 
-    def get_module(self, skip_list: List[Tuple[int, int]] = []):
+    def get_module(self, skip_list: List[Tuple[int, int]] = [], verbose=False):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
         if key not in self.module_cache:
             print(f"Compiling custom matmul kernel with tile size {self.threads_per_dim} and skipping {skip_list}")
@@ -94,7 +94,7 @@ class CustomMatmulManager():
                     name=self.name,
                     cpp_sources="",
                     cuda_sources=processed_src,
-                    verbose=True,
+                    verbose=verbose,
                 )
             }
             if self.save_kernels:
