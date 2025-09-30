@@ -83,7 +83,7 @@ class CustomMatmulManager():
     def get_module(self, skip_list: List[Tuple[int, int]] = [], verbose=False):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
         if key not in self.module_cache:
-            print(f"Compiling custom matmul kernel with tile size {self.threads_per_dim} and skipping {skip_list}")
+            print(f"Compiling custom matmul kernel with tile size {self.threads_per_dim} and skipping {skip_list[:5]}... ({len(skip_list)} elements)")
             skip_pred = " || ".join([f"(bx == {bx} && by == {by})" for bx, by in skip_list])
             if skip_pred == "":
                 skip_pred = "false"
