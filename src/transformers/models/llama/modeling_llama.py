@@ -284,7 +284,6 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.matmul_manager = None
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -296,12 +295,13 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        matmul_manager = None,
         use_custom_matmul: List[Tuple[int, int]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        if use_custom_matmul is not None and self.matmul_manager is None:
-            self.matmul_manager = CustomMatmulManager(threads_per_dim=16)
-
+        if use_custom_matmul is not None:
+            assert matmul_manager is not None
+        
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -320,7 +320,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, matmul_manager=self.matmul_manager, use_custom_matmul=use_custom_matmul)
+        hidden_states = self.mlp(hidden_states, matmul_manager=matmul_manager, use_custom_matmul=use_custom_matmul)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -362,6 +362,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.matmul_manager = None
         self.first_time = True
 
     @check_model_inputs
@@ -423,6 +424,8 @@ class LlamaModel(LlamaPreTrainedModel):
             this_layer_use_custom = None
             if use_custom_matmul is not None and i in use_custom_matmul.keys():
                 this_layer_use_custom = use_custom_matmul[i]
+                if self.matmul_manager is None:
+                   self.matmul_manager = CustomMatmulManager(threads_per_dim=16)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -430,6 +433,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                matmul_manager=self.matmul_manager,
                 use_custom_matmul=this_layer_use_custom,
                 **kwargs,
             )
