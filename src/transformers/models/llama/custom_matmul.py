@@ -4,6 +4,7 @@ from torch.utils.cpp_extension import load_inline
 import pymongo
 import subprocess
 import time 
+import torch
 
 NAIVE_FP32_KERNEL_TEMPLATE="""
 #include <torch/extension.h>
@@ -134,13 +135,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 class CustomMatmulManager():
-    def __init__(self, kernel_type="naive_fp32", threads_per_dim:int=16, save_kernels=False):
-        self.kernel_type = kernel_type
-        assert self.kernel_type in ["naive_fp32", "naive_fp16"]
-        if self.kernel_type == "naive_fp32":
-            self.template_to_use = NAIVE_FP32_KERNEL_TEMPLATE
-        else:
-            self.template_to_use = NAIVE_FP16_KERNEL_TEMPLATE
+    def __init__(self, threads_per_dim:int=16, save_kernels=False):
+        self.template_to_use = {
+            torch.float32: NAIVE_FP32_KERNEL_TEMPLATE,
+            torch.float16: NAIVE_FP16_KERNEL_TEMPLATE
+        }
 
         self.threads_per_dim = threads_per_dim
         self.module_cache = {}
@@ -151,9 +150,7 @@ class CustomMatmulManager():
         self.save_kernels = save_kernels
         self.name = f"custom_matmul_{int(time.time()//1)}"
 
-        
-    
-    def get_module(self, skip_list: List[Tuple[int, int]] = [], verbose=False):
+    def get_module(self, dtype=torch.float32, skip_list: List[Tuple[int, int]] = [], verbose=False):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
         if key not in self.module_cache:
             print(f"Compiling custom matmul kernel with tile size {self.threads_per_dim} and skipping {skip_list[:5]}... ({len(skip_list)} elements)")
@@ -161,7 +158,7 @@ class CustomMatmulManager():
             if skip_pred == "":
                 skip_pred = "false"
              
-            processed_src = self.template_to_use.replace("###THREADS_PER_DIM###", str(self.threads_per_dim)).replace("###SKIP_PRED###", skip_pred)
+            processed_src = self.template_to_use[dtype].replace("###THREADS_PER_DIM###", str(self.threads_per_dim)).replace("###SKIP_PRED###", skip_pred)
             self.module_cache[key] = {
                 "src": processed_src,   
                 "kernel": load_inline(
@@ -181,6 +178,8 @@ class CustomMatmulManager():
         return self.module_cache[key]["kernel"]
 
     def multiply(self, A, B, skip_list: List[Tuple[int, int]] = [], verbose=False):
+        assert A.dtype == B.dtype, f"Data types of A and B dont match: {A.dtype}, {B.dtype}"
+        assert A.dtype in self.template_to_use.keys(), f"Matmul impl for dtype={A.dtype} not found."
         assert A.dim() == 2 and B.dim() == 2, "Only 2D tensors supported"
         assert A.shape[1] == B.shape[0], "Incompatible shapes for matmul"
         M = A.shape[0]
@@ -196,7 +195,7 @@ class CustomMatmulManager():
         for bx, by in skip_list:
             assert 0 <= bx < blocks_x and 0 <= by < blocks_y, f"Skip block ({bx}, {by}) out of range ({blocks_x}, {blocks_y})"
 
-        module = self.get_module(skip_list=skip_list)
+        module = self.get_module(dtype=A.dtype, skip_list=skip_list)
         return module.matmul_cuda(A, B)
 
     def save_cache(self):

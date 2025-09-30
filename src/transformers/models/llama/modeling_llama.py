@@ -47,8 +47,6 @@ from .configuration_llama import LlamaConfig
 
 from .custom_matmul import CustomMatmulManager
 logger = logging.get_logger(__name__)
-matmul_manager = CustomMatmulManager(threads_per_dim=16)
-first_time = True
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -152,9 +150,10 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x, use_custom_matmul:List[Tuple[int, int]] = None):
+    def forward(self, x, matmul_manager=None, use_custom_matmul:List[Tuple[int, int]] = None):
         z = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         if use_custom_matmul is not None:
+            assert matmul_manager is not None, f"Cannot run custom matmul w/o being provided a manager. :-("
             z2d = z.reshape(-1, z.size(-1))
             down_proj2d = matmul_manager.multiply(
                 z2d, self.down_proj.weight.t(),
@@ -285,6 +284,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.matmul_manager = None
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -299,6 +299,9 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_custom_matmul: List[Tuple[int, int]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        if use_custom_matmul is not None and self.matmul_manager is None:
+            self.matmul_manager = CustomMatmulManager(threads_per_dim=16)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -317,7 +320,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, use_custom_matmul=use_custom_matmul)
+        hidden_states = self.mlp(hidden_states, matmul_manager=self.matmul_manager, use_custom_matmul=use_custom_matmul)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -359,6 +362,8 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.first_time = True
+
     @check_model_inputs
     @auto_docstring
     def forward(
@@ -373,11 +378,14 @@ class LlamaModel(LlamaPreTrainedModel):
         use_custom_matmul: Optional[Dict[int, List[Tuple[int, int]]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        global first_time
+        r'''
+        use_custom_matmul (`Dict[int, List[Tuple[int, int]]]`, *optional*, defaults to None):
+            Dictionary that maps from layer_idx -> list of block ids to skip during matmul of that layer_idx.
+        '''
         if use_custom_matmul is not None:
-            if first_time:
+            if self.first_time:
                 print("[WARN] [WARN] [WARN] Using experimental feature `use_custom_matmul`.")
-                first_time = False
+                self.first_time = False
             for idx in use_custom_matmul.keys():
                 assert isinstance(idx, int) and idx < len(self.layers) and idx < self.config.num_hidden_layers
 
@@ -464,6 +472,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         use_custom_matmul: Optional[Dict[int, List[Tuple[int, int]]]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r'''
+        use_custom_matmul (`Dict[int, List[Tuple[int, int]]]`, *optional*, defaults to None):
+            Dictionary that maps from layer_idx -> list of block ids to skip during matmul of that layer_idx.
+        '''
+        
         r"""
         Example:
 
