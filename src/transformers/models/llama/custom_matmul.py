@@ -5,7 +5,7 @@ import pymongo
 import subprocess
 import time 
 
-CUSTOM_KERNEL_TEMPLATE="""
+NAIVE_FP32_KERNEL_TEMPLATE="""
 #include <torch/extension.h>
 #include <iostream>
 
@@ -69,8 +69,79 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 }}
 """
 
+NAIVE_FP16_KERNEL_TEMPLATE="""
+#include <torch/extension.h>
+#include <cuda_fp16.h>
+#include <iostream>
+
+#define THREADS_PER_DIM ###THREADS_PER_DIM###
+
+__device__ __forceinline__ bool should_skip(int bx, int by) {
+    return ###SKIP_PRED###;
+}
+
+__global__ void MatMulNaiveFP16(const half* __restrict__ A,
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+    if (should_skip(blockIdx.x, blockIdx.y)) return;
+
+    float sum = 0.f; // accumulate in FP32 for accuracy
+    for (int k = 0; k < K; ++k) {
+        sum += __half2float(A[row * K + k]) *
+               __half2float(B[k * N + col]);
+    }
+    C[row * N + col] = __float2half(sum);
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "A and B must be CUDA tensors");
+    TORCH_CHECK(A.dtype() == torch::kFloat16 && B.dtype() == torch::kFloat16,
+                "A and B must be float16 (torch.float16)");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Only 2D tensors supported");
+    TORCH_CHECK(A.size(1) == B.size(0), "Incompatible matrix shapes");
+
+    auto A_ = A.contiguous();
+    auto B_ = B.contiguous();
+
+    int M = A_.size(0);
+    int K = A_.size(1);
+    int N = B_.size(1);
+
+    auto C = torch::zeros({M, N}, A_.options());
+
+    dim3 threads(THREADS_PER_DIM, THREADS_PER_DIM);
+    dim3 blocks((N + THREADS_PER_DIM - 1) / THREADS_PER_DIM,
+                (M + THREADS_PER_DIM - 1) / THREADS_PER_DIM);
+
+    MatMulNaiveFP16<<<blocks, threads>>>(
+        reinterpret_cast<const half*>(A_.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(B_.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+        M, N, K
+    );
+
+    return C;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_cuda", &matmul_cuda, "Naive matmul (CUDA, FP16)");
+}
+
+"""
+
 class CustomMatmulManager():
-    def __init__(self, threads_per_dim:int=16, save_kernels=False):
+    def __init__(self, kernel_type="naive_fp32", threads_per_dim:int=16, save_kernels=False):
+        self.kernel_type = kernel_type
+        assert self.kernel_type in ["naive_fp32", "naive_fp16"]
+        if self.kernel_type == "naive_fp32":
+            self.template_to_use = NAIVE_FP32_KERNEL_TEMPLATE
+        else:
+            self.template_to_use = NAIVE_FP16_KERNEL_TEMPLATE
+
         self.threads_per_dim = threads_per_dim
         self.module_cache = {}
         # setup pymongo connection
@@ -80,6 +151,8 @@ class CustomMatmulManager():
         self.save_kernels = save_kernels
         self.name = f"custom_matmul_{int(time.time()//1)}"
 
+        
+    
     def get_module(self, skip_list: List[Tuple[int, int]] = [], verbose=False):
         key = (self.threads_per_dim, tuple(sorted(skip_list)))
         if key not in self.module_cache:
@@ -87,7 +160,8 @@ class CustomMatmulManager():
             skip_pred = " || ".join([f"(bx == {bx} && by == {by})" for bx, by in skip_list])
             if skip_pred == "":
                 skip_pred = "false"
-            processed_src = CUSTOM_KERNEL_TEMPLATE.replace("###THREADS_PER_DIM###", str(self.threads_per_dim)).replace("###SKIP_PRED###", skip_pred)
+             
+            processed_src = self.template_to_use.replace("###THREADS_PER_DIM###", str(self.threads_per_dim)).replace("###SKIP_PRED###", skip_pred)
             self.module_cache[key] = {
                 "src": processed_src,   
                 "kernel": load_inline(
