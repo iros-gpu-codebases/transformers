@@ -134,11 +134,105 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 """
 
+WMMA_FP16_MATMUL_TEMPLATE = """
+#include <torch/extension.h>
+#include <mma.h>
+#include <cuda_fp16.h>
+using namespace nvcuda;
+
+__device__ __forceinline__ bool should_skip(int bx, int by) {
+    return ###SKIP_PRED###;
+}
+
+// One 16x16 tile per block; 32 threads (one warp) per block.
+__global__ void WMMAMatMulFP16(const half* __restrict__ A,
+                               const half* __restrict__ B,
+                               half* __restrict__ C,
+                               int M, int N, int K) {
+    const int tile_m = blockIdx.y;   // tile row
+    const int tile_n = blockIdx.x;   // tile col
+    const int row0   = tile_m * 16;
+    const int col0   = tile_n * 16;
+
+    if (row0 >= M || col0 >= N) return;
+    if (should_skip(blockIdx.x, blockIdx.y)) return;
+
+    // Accumulate in FP32.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    // A = row-major, B = col-major; both 16x16 steps across K.
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+
+    // NOTE: assumes M, N, K are multiples of 16. (Pad otherwise.)
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        const half* ptrA = A + row0 * K + k0;
+        const half* ptrB = B + k0 * N + col0;
+        wmma::load_matrix_sync(a_frag, ptrA, K);
+        wmma::load_matrix_sync(b_frag, ptrB, N);
+        wmma::mma_sync(acc, a_frag, b_frag, acc);
+    }
+
+    // wmma::store_matrix_sync expects a float* for an FP32 accumulator.
+    __shared__ float c_tile[16 * 16];
+    wmma::store_matrix_sync(c_tile, acc, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    // Cast-and-store to half C.
+    int t = threadIdx.x; // 0..31
+    for (int idx = t; idx < 256; idx += blockDim.x) {
+        int r = idx / 16;
+        int c = idx % 16;
+        int gr = row0 + r;
+        int gc = col0 + c;
+        if (gr < M && gc < N) {
+            C[gr * N + gc] = __float2half(c_tile[idx]);
+        }
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "A and B must be CUDA tensors");
+    TORCH_CHECK(A.dtype() == torch::kFloat16 && B.dtype() == torch::kFloat16,
+                "A and B must be float16 (torch.float16)");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Only 2D tensors supported");
+    TORCH_CHECK(A.size(1) == B.size(0), "Incompatible matrix shapes");
+
+    auto A_ = A.contiguous();
+    auto B_ = B.contiguous();
+
+    int M = A_.size(0);
+    int K = A_.size(1);
+    int N = B_.size(1);
+
+    auto C = torch::zeros({M, N}, A_.options());
+
+    dim3 threads(32, 1, 1);                   // one warp
+    dim3 blocks((N + 15) / 16, (M + 15) / 16); // one 16x16 tile per block
+
+    WMMAMatMulFP16<<<blocks, threads>>>(
+        reinterpret_cast<const half*>(A_.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(B_.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+        M, N, K
+    );
+
+    return C;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_cuda", &matmul_cuda, "WMMA FP16 matmul (CUDA)");
+}
+"""
+
+
 class CustomMatmulManager():
-    def __init__(self, threads_per_dim:int=16, save_kernels=False):
+    def __init__(self, threads_per_dim:int=16, use_tensor_cores=True, save_kernels=False):
+        self.use_tensor_cores = use_tensor_cores
         self.template_to_use = {
             torch.float32: NAIVE_FP32_KERNEL_TEMPLATE,
-            torch.float16: NAIVE_FP16_KERNEL_TEMPLATE
+            torch.float16: WMMA_FP16_MATMUL_TEMPLATE if use_tensor_cores else NAIVE_FP16_KERNEL_TEMPLATE
         }
 
         self.threads_per_dim = threads_per_dim
